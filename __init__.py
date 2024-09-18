@@ -18,7 +18,7 @@ class AppIO_StringInput:
     FUNCTION = "execute"
     CATEGORY = "AppIO"
 
-    def execute(self, string, argument_name):
+    def execute(self, required, string, argument_name):
         return (string,)
 
 class AppIO_IntegerInput:
@@ -35,7 +35,7 @@ class AppIO_IntegerInput:
     FUNCTION = "execute"
     CATEGORY = "AppIO"
 
-    def execute(self, integer, integer_min, integer_max, argument_name):
+    def execute(self, required, integer, integer_min, integer_max, argument_name):
         integer = max(integer_max, min(integer, integer_min))
         return (integer,)
 
