@@ -113,6 +113,18 @@ class AppIO_ImageInput:
             return "Invalid image file: {}".format(image)
 
         return True
+
+class AppIO_ImageInputFromID:
+    @classmethod
+    def INPUT_TYPES(s):
+        return dict(required=dict(
+            argument_name=create_type("STRING", multiline=False, default='')
+        ))
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "execute"
+    CATEGORY = "AppIO"
+    def execute(self, argument_name):
+        raise NotImplementedError("This node only works when running on ComfyUI-backed-bot")
     
 class AppIO_StringOutput:
     @classmethod
@@ -216,5 +228,6 @@ NODE_CLASS_MAPPINGS = {
     "AppIO_StringOutput": AppIO_StringOutput,
     "AppIO_ImageOutput": AppIO_ImageOutput,
     "AppIO_IntegerInput": AppIO_IntegerInput,
-    "AppIO_FitResizeImage": AppIO_FitResizeImage
+    "AppIO_FitResizeImage": AppIO_FitResizeImage,
+    "AppIO_ImageInputFromID": AppIO_ImageInputFromID
 }
