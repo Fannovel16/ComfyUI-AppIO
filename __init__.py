@@ -1,6 +1,8 @@
 from PIL import Image
 import numpy as np
 import torch
+from collections import namedtuple
+from einops import repeat, rearrange
 
 def create_type(type, **kwargs):
     return (type, kwargs)
@@ -221,6 +223,55 @@ class AppIO_FitResizeImage:
         resized_image = img.resize((new_width, new_height), resample=Image.Resampling(resample_filters[resampling]))
 
         return (self.pil2tensor(resized_image),new_width,new_height,aspect_ratio)
+
+SEG = namedtuple("SEG",
+                 ['cropped_image', 'cropped_mask', 'confidence', 'crop_region', 'bbox', 'label', 'control_net_wrapper'],
+                 defaults=[None])
+
+class AppIO_ResizeInstanceImageMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": dict(
+                image=create_type("IMAGE"),
+                mask=create_type("MASK"),
+                move_x=create_type("INT", min=-1024, max=1024, step=1, default=0),
+                move_y=create_type("INT", min=-1024, max=1024, step=1, default=0),
+                max_size=create_type("INT", min=16, max=2048, default=512, step=16),
+                resampling=create_type(["lanczos", "nearest", "bilinear", "bicubic"]),
+                upscale=create_type(["false", "true"], default="true"),
+            )
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    FUNCTION = "resize"
+    CATEGORY = "AppIO"
+
+    def resize(self, image, mask, move_x: int, move_y: int, **kwargs):
+        from nodes import NODE_CLASS_MAPPINGS
+        segs, *_ = NODE_CLASS_MAPPINGS["MaskToSEGS"]().doit(mask, combined=False, crop_factor=1, bbox_fill=False, drop_size=10, contour_fill=False)
+        resizer = AppIO_FitResizeImage()
+        (frame_h, frame_w), *segs = segs
+        
+        image_canvas = torch.zeros(1, frame_h, frame_w, 3, dtype=torch.float)
+        mask_canvas = torch.zeros(frame_h, frame_w, dtype=torch.float)
+
+        for seg in segs[0]:
+            x1, y1, x2, y2 = tuple(map(int, seg.crop_region))
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            cx += move_x; cy += move_y
+
+            cropped_mask = repeat(torch.from_numpy(seg.cropped_mask).float(), "h w -> 1 h w 3")
+            resized_mask = resizer.fit_resize_image(cropped_mask, **kwargs)[0].mean(-1).squeeze()
+            resized_image = resizer.fit_resize_image(image[:, y1:y2, x1:x2, :], **kwargs)[0]
+            resized_image *= rearrange(resized_mask, "h w -> 1 h w 1")
+            
+            h, w = resized_mask.shape
+            x1, y1, x2, y2 = cx-(w//2), cy-(h//2), cx+(w//2), cy+(h//2)
+            x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, frame_w), min(y2, frame_w)
+            mask_canvas[y1:y2, x1:x2] = resized_mask[:(y2-y1), :(x2-x1)]
+            image_canvas[:, y1:y2, x1:x2, :] = resized_image[:, :(y2-y1), :(y2-y1), :]
+        return (image_canvas, mask_canvas)
     
 NODE_CLASS_MAPPINGS = {
     "AppIO_StringInput": AppIO_StringInput,
@@ -229,5 +280,6 @@ NODE_CLASS_MAPPINGS = {
     "AppIO_ImageOutput": AppIO_ImageOutput,
     "AppIO_IntegerInput": AppIO_IntegerInput,
     "AppIO_FitResizeImage": AppIO_FitResizeImage,
-    "AppIO_ImageInputFromID": AppIO_ImageInputFromID
+    "AppIO_ImageInputFromID": AppIO_ImageInputFromID,
+    "AppIO_ResizeInstanceImageMask": AppIO_ResizeInstanceImageMask
 }
