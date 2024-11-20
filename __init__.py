@@ -1,4 +1,4 @@
-from PIL import Image
+from PIL import Image, ImageColor
 import numpy as np
 import torch
 from collections import namedtuple
@@ -235,11 +235,17 @@ class AppIO_ResizeInstanceImageMask:
             "required": dict(
                 image=create_type("IMAGE"),
                 mask=create_type("MASK"),
+                expand_out_mask=create_type("INT", min=-1024, max=1024, step=1, default=0),
                 move_x=create_type("INT", min=-1024, max=1024, step=1, default=0),
                 move_y=create_type("INT", min=-1024, max=1024, step=1, default=0),
+
                 max_size=create_type("INT", min=16, max=2048, default=512, step=16),
                 resampling=create_type(["lanczos", "nearest", "bilinear", "bicubic"]),
                 upscale=create_type(["false", "true"], default="true"),
+            ),
+            "optional": dict(
+                opt_bg_image=create_type("IMAGE"),
+                opt_bg_mask=create_type("MASK")
             )
         }
 
@@ -247,30 +253,53 @@ class AppIO_ResizeInstanceImageMask:
     FUNCTION = "resize"
     CATEGORY = "AppIO"
 
-    def resize(self, image, mask, move_x: int, move_y: int, **kwargs):
+    def resize(self, image, mask, expand_out_mask: int, move_x: int, move_y: int, opt_bg_image=None, opt_bg_mask=None, **kwargs):
         from nodes import NODE_CLASS_MAPPINGS
-        segs, *_ = NODE_CLASS_MAPPINGS["MaskToSEGS"]().doit(mask, combined=False, crop_factor=1, bbox_fill=False, drop_size=10, contour_fill=False)
         resizer = AppIO_FitResizeImage()
-        (frame_h, frame_w), *segs = segs
+        mask_to_segs = NODE_CLASS_MAPPINGS["MaskToSEGS"]()
+        grow_mask = NODE_CLASS_MAPPINGS["GrowMask"]()
         
-        image_canvas = torch.zeros(1, frame_h, frame_w, 3, dtype=torch.float)
-        mask_canvas = torch.zeros(frame_h, frame_w, dtype=torch.float)
+        segs, *_ = mask_to_segs.doit(mask, combined=False, crop_factor=1, bbox_fill=False, drop_size=10, contour_fill=False)
+        (frame_h, frame_w), *segs = segs
+        if opt_bg_image is not None:
+            image_canvas = opt_bg_image[:1,...,:3].clone()
+        else:
+            image_canvas = torch.zeros(1, frame_h, frame_w, 3)
+        mask_canvas = torch.zeros_like(image_canvas)[0,:,:,0]
+
+        if opt_bg_mask is not None:
+            opt_segs, *_ = mask_to_segs.doit(opt_bg_mask, combined=False, crop_factor=1, bbox_fill=False, drop_size=10, contour_fill=False)
+            _, *opt_segs = opt_segs
+            opt_seg = opt_segs[0][0]
+            place_x1, place_y1, place_x2, place_y2 = tuple(map(int, opt_seg.crop_region))
 
         for seg in segs[0]:
             x1, y1, x2, y2 = tuple(map(int, seg.crop_region))
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            cx += move_x; cy += move_y
 
             cropped_mask = repeat(torch.from_numpy(seg.cropped_mask).float(), "h w -> 1 h w 3")
             resized_mask = resizer.fit_resize_image(cropped_mask, **kwargs)[0].mean(-1).squeeze()
             resized_image = resizer.fit_resize_image(image[:, y1:y2, x1:x2, :], **kwargs)[0]
-            resized_image *= rearrange(resized_mask, "h w -> 1 h w 1")
+            resized_mask_nhwc = rearrange(resized_mask, "h w -> 1 h w 1")
+            resized_image *= resized_mask_nhwc
             
+            if opt_bg_mask is None:
+                place_x1, place_y1, place_x2, place_y2 = x1, y1, x2, y2
+            cx, cy = (place_x1 + place_x2) // 2, (place_y1 + place_y2) // 2
+            cx += move_x; cy += move_y
             h, w = resized_mask.shape
             x1, y1, x2, y2 = cx-(w//2), cy-(h//2), cx+(w//2), cy+(h//2)
             x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, frame_w), min(y2, frame_w)
-            mask_canvas[y1:y2, x1:x2] = resized_mask[:(y2-y1), :(x2-x1)]
-            image_canvas[:, y1:y2, x1:x2, :] = resized_image[:, :(y2-y1), :(y2-y1), :]
+            
+            max_h, max_w = (y2-y1), (x2-x1)
+            mask_canvas[y1:y2, x1:x2] = resized_mask[:max_h, :max_w]
+            
+            resized_mask_nhwc = resized_mask_nhwc[:, :max_h, :max_w, :]
+            resized_image = resized_image[:, :max_h, :max_w, :3]
+            image_canvas[:, y1:y2, x1:x2, :3] = (
+                resized_image + 
+                image_canvas[:, y1:y2, x1:x2, :3] * (1 - resized_mask_nhwc)
+            )
+        mask_canvas = grow_mask.expand_mask(mask_canvas, expand=expand_out_mask, tapered_corners=True)[0]
         return (image_canvas, mask_canvas)
     
 NODE_CLASS_MAPPINGS = {
