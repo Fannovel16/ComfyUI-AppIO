@@ -1,4 +1,4 @@
-from PIL import Image, ImageColor
+from PIL import Image, ImageDraw
 import numpy as np
 import torch
 from collections import namedtuple
@@ -245,7 +245,8 @@ class AppIO_ResizeInstanceImageMask:
             ),
             "optional": dict(
                 opt_bg_image=create_type("IMAGE"),
-                opt_bg_mask=create_type("MASK")
+                opt_bg_mask=create_type("MASK"),
+                opt_mask_shape=create_type(['none', 'circle', 'square', 'triangle'])
             )
         }
 
@@ -253,7 +254,36 @@ class AppIO_ResizeInstanceImageMask:
     FUNCTION = "resize"
     CATEGORY = "AppIO"
 
-    def resize(self, image, mask, expand_out_mask: int, move_x: int, move_y: int, opt_bg_image=None, opt_bg_mask=None, **kwargs):
+    #Ref: https://github.com/kijai/ComfyUI-KJNodes/blob/1dbb38d63dd9769b15a85c4c527391f955242568/nodes/mask_nodes.py#L800
+    def create_shape_mask(self, shape, width, height):
+        image = Image.new("RGB", (width, height), "black")
+        draw = ImageDraw.Draw(image)
+        color = 'white'
+
+        location_x = width // 2
+        location_y = height // 2
+
+        if shape == 'circle' or shape == 'square':
+            # Define the bounding box for the shape
+            left_up_point = (location_x - width // 2, location_y - height // 2)
+            right_down_point = (location_x + width // 2, location_y + height // 2)
+            two_points = [left_up_point, right_down_point]
+
+            if shape == 'circle':
+                draw.ellipse(two_points, fill=color)
+            elif shape == 'square':
+                draw.rectangle(two_points, fill=color)
+                
+        elif shape == 'triangle':
+            # Define the points for the triangle
+            left_up_point = (location_x - width // 2, location_y + height // 2) # bottom left
+            right_down_point = (location_x + width // 2, location_y + height // 2) # bottom right
+            top_point = (location_x, location_y - height // 2) # top point
+            draw.polygon([top_point, left_up_point, right_down_point], fill=color)
+
+        return torch.from_numpy(np.array(image)).float().__div__(255.)[:, :, 0]
+
+    def resize(self, image, mask, expand_out_mask: int, move_x: int, move_y: int, opt_bg_image=None, opt_bg_mask=None, opt_mask_shape='none', **kwargs):
         from nodes import NODE_CLASS_MAPPINGS
         resizer = AppIO_FitResizeImage()
         mask_to_segs = NODE_CLASS_MAPPINGS["MaskToSEGS"]()
@@ -281,6 +311,9 @@ class AppIO_ResizeInstanceImageMask:
             resized_image = resizer.fit_resize_image(image[:, y1:y2, x1:x2, :], **kwargs)[0]
             resized_mask_nhwc = rearrange(resized_mask, "h w -> 1 h w 1")
             resized_image *= resized_mask_nhwc
+            if opt_mask_shape != 'none':
+                cropped_mask = repeat(self.create_shape_mask(opt_mask_shape, x2-x1, y2-y1), "h w -> 1 h w 3")
+                resized_mask = resizer.fit_resize_image(cropped_mask, **kwargs)[0].mean(-1).squeeze()
             
             if opt_bg_mask is None:
                 place_x1, place_y1, place_x2, place_y2 = x1, y1, x2, y2
