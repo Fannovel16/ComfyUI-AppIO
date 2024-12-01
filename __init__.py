@@ -3,6 +3,8 @@ import numpy as np
 import torch
 from collections import namedtuple
 from einops import repeat, rearrange
+import torchvision.transforms.functional as TF
+from dataclasses import dataclass
 
 def create_type(type, **kwargs):
     return (type, kwargs)
@@ -167,11 +169,12 @@ class AppIO_FitResizeImage:
                 "max_size": ("INT", {"default": 768, "step": 8}),
                 "resampling": (["lanczos", "nearest", "bilinear", "bicubic"],),
                 "upscale": (["false", "true"],)
-            }
+            },
+            "optional" : { "opt_mask": ("MASK",)}
         }
 
-    RETURN_TYPES = ("IMAGE","INT","INT","FLOAT")
-    RETURN_NAMES = ("Image","Fit Width", "Fit Height", "Aspect Ratio")
+    RETURN_TYPES = ("IMAGE","INT","INT","FLOAT", "MASK")
+    RETURN_NAMES = ("Image","Fit Width", "Fit Height", "Aspect Ratio", "Mask")
     FUNCTION = "fit_resize_image"
 
     CATEGORY = "AppIO"
@@ -209,7 +212,7 @@ class AppIO_FitResizeImage:
         size = samples.shape[3], samples.shape[2]
         return size
 
-    def fit_resize_image(self, image, max_size=768, resampling="bicubic", upscale="false"):
+    def fit_resize_image(self, image, max_size=768, resampling="bicubic", upscale="false", opt_mask=None):
         resample_filters = {
             'nearest': 0,
             'lanczos': 1,
@@ -221,12 +224,51 @@ class AppIO_FitResizeImage:
 
         new_width, new_height, aspect_ratio = self.get_max_size(size[0], size[1], max_size, upscale)
         resized_image = img.resize((new_width, new_height), resample=Image.Resampling(resample_filters[resampling]))
+        resized_image = self.pil2tensor(resized_image)
 
-        return (self.pil2tensor(resized_image),new_width,new_height,aspect_ratio)
+        resized_mask = torch.zeros_like(resized_image)[...,0]
+        if opt_mask is not None:
+            mask_img = self.tensor2pil(repeat(opt_mask, "n h w -> n h w c", c=3))
+            resized_mask = mask_img.resize((new_width, new_height), resample=Image.Resampling(resample_filters[resampling]))
+            resized_mask = self.pil2tensor(resized_mask).mean(-1)
+        
+        return (resized_image,new_width,new_height,aspect_ratio,resized_mask)
 
 SEG = namedtuple("SEG",
                  ['cropped_image', 'cropped_mask', 'confidence', 'crop_region', 'bbox', 'label', 'control_net_wrapper'],
                  defaults=[None])
+
+class BBox:
+    def __init__(self, x1, y1, x2, y2):
+        self.x1, self.y1, self.x2, self.y2 = [int(x) for x in (x1, y1, x2, y2)]
+
+    @property
+    def w(self):
+        return self.x2 - self.x1
+
+    @property
+    def h(self):
+        return self.y2 - self.y1
+
+    @property
+    def cx(self):
+        return self.x1 + self.w // 2
+
+    @property
+    def cy(self):
+        return self.y1 + self.h // 2
+
+    def update(self, dw, dh):
+        """Expand or shrink the bounding box by dw and dh."""
+        self.x1, self.x2 = max(self.x1 - dw, 0), self.x2 + dw
+        self.y1, self.y2 = max(self.y1 - dh, 0), self.y2 + dh
+
+    def adjust_to_center(self, cx, cy, new_width, new_height, max_w, max_h):
+        """Recenter and constrain the bounding box within image dimensions."""
+        self.x1, self.x2 = cx - (new_width // 2), cx + (new_width // 2)
+        self.y1, self.y2 = cy - (new_height // 2), cy + (new_height // 2)
+        self.x1, self.x2 = max(self.x1, 0), min(self.x2, max_w)
+        self.y1, self.y2 = max(self.y1, 0), min(self.y2, max_h)
 
 class AppIO_ResizeInstanceImageMask:
     @classmethod
@@ -304,6 +346,7 @@ class AppIO_ResizeInstanceImageMask:
             place_x1, place_y1, place_x2, place_y2 = tuple(map(int, opt_seg.crop_region))
 
         for seg in segs[0]:
+            seg: SEG = seg
             x1, y1, x2, y2 = tuple(map(int, seg.crop_region))
 
             cropped_mask = repeat(torch.from_numpy(seg.cropped_mask).float(), "h w -> 1 h w 3")
@@ -334,7 +377,84 @@ class AppIO_ResizeInstanceImageMask:
             )
         mask_canvas = grow_mask.expand_mask(mask_canvas, expand=expand_out_mask, tapered_corners=True)[0]
         return (image_canvas, mask_canvas)
+
+class AppIO_ResizeInstanceAndPaste:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": dict(
+                input_image=create_type("IMAGE"),
+                input_segs=create_type("SEGS"),
+                bg_image=create_type("IMAGE"),
+                bg_image_segs=create_type("SEGS"),
+                scale_factor=create_type("FLOAT", min=0.1, max=5, step=0.1, default=1.),
+                move_x=create_type("INT", min=-1024, max=1024, step=1, default=0),
+                move_y=create_type("INT", min=-1024, max=1024, step=1, default=0),
+                
+                pad_width=create_type("INT", min=0, max=1024, step=1, default=64),
+                pad_height=create_type("INT", min=0, max=1024, step=1, default=64),
+                
+                expand_out_mask=create_type("INT", min=-1024, max=1024, step=1, default=0)
+            )
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    FUNCTION = "resize_paste"
+    CATEGORY = "AppIO"
     
+    def resize_paste(self, input_image, input_segs, bg_image, bg_image_segs, 
+                     scale_factor: int, move_x: int, move_y: int, pad_width: int, pad_height: int, expand_out_mask: int):
+        from nodes import NODE_CLASS_MAPPINGS
+        segs_to_mask = NODE_CLASS_MAPPINGS["SegsToCombinedMask"]()
+        grow_mask = NODE_CLASS_MAPPINGS["GrowMask"]()
+
+        dx, dy = move_x // 2, move_y // 2
+        dw, dh = pad_width // 2, pad_height // 2
+
+        # Extract primary segmentation masks
+        _, *input_segs = input_segs
+        _, *bg_segs = bg_image_segs
+        input_seg = input_segs[0][0]
+        bg_seg = bg_segs[0][0]
+
+        # Initialize bounding boxes
+        inp = BBox(*input_seg.crop_region)
+        bg = BBox(*bg_seg.crop_region)
+
+        # Compute scale factor and resize input_bbox
+        scale_factor *= max(bg.w / inp.w, bg.h / inp.h)
+        inp.update(dw, dh)
+        new_height = int(inp.h * scale_factor // 2 * 2)
+        new_width = int(inp.w * scale_factor // 2 * 2)
+
+        # Process input image
+        input_image = rearrange(input_image, "b h w c -> b c h w").clone()
+        resized_crop = TF.resize(
+            input_image[:, :, inp.y1:inp.y2, inp.x1:inp.x2],
+            (new_height, new_width)
+        )
+        resized_crop = rearrange(resized_crop, "b c h w -> b h w c").clone()
+
+        # Prepare result image
+        result_image = bg_image.clone()
+        max_h, max_w = result_image.shape[1:3]
+
+        # Adjust bg_bbox and paste resized_crop
+        bg.adjust_to_center(bg.cx + dx, bg.cy + dy, new_width, new_height, max_w, max_h)
+        result_image[:, bg.y1:bg.y2, bg.x1:bg.x2, :] = resized_crop[
+            :, :bg.y2 - bg.y1, :bg.x2 - bg.x1
+        ]
+
+        # Generate result mask
+        result_mask = grow_mask.expand_mask(
+            segs_to_mask.doit(bg_image_segs)[0],
+            expand=expand_out_mask,
+            tapered_corners=True
+        )[0]
+
+        return result_image, result_mask
+
+
 NODE_CLASS_MAPPINGS = {
     "AppIO_StringInput": AppIO_StringInput,
     "AppIO_ImageInput": AppIO_ImageInput,
@@ -343,5 +463,6 @@ NODE_CLASS_MAPPINGS = {
     "AppIO_IntegerInput": AppIO_IntegerInput,
     "AppIO_FitResizeImage": AppIO_FitResizeImage,
     "AppIO_ImageInputFromID": AppIO_ImageInputFromID,
-    "AppIO_ResizeInstanceImageMask": AppIO_ResizeInstanceImageMask
+    "AppIO_ResizeInstanceImageMask": AppIO_ResizeInstanceImageMask,
+    "AppIO_ResizeInstanceAndPaste": AppIO_ResizeInstanceAndPaste
 }
